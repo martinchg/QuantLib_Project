@@ -33,6 +33,7 @@
 #include "constantblackscholesprocess.hpp"
 #include "constant_process_helper.hpp"
 #include <ql/payoff.hpp>
+#include <cmath>
 
 namespace QuantLib {
 
@@ -173,11 +174,11 @@ namespace QuantLib {
             boost::dynamic_pointer_cast<GeneralizedBlackScholesProcess>(this->process_);
         QL_REQUIRE(process, "Black-Scholes process required");
 
-        // default: comportement QuantLib (non-constant)
+        // default mode: QuantLib behavior (non-constant)
         DiscountFactor disc =
             process->riskFreeRate()->discount(this->timeGrid().back());
 
-        // constant mode: disc = exp(-r*T) avec r figé à maturité
+        // constant mode: disc = exp(-r*T) with r frozen at maturity
         if (useConstantParameters_) {
             Date maturity = this->arguments_.exercise->lastDate();
 
