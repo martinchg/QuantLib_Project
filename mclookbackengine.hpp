@@ -29,6 +29,9 @@
 #include <ql/pricingengines/mcsimulation.hpp>
 #include <ql/processes/blackscholesprocess.hpp>
 #include <utility>
+#include "constantblackscholesprocess.hpp"
+#include "constant_process_helper.hpp"
+#include <cmath>
 
 namespace QuantLib {
 
@@ -43,6 +46,7 @@ namespace QuantLib {
             path_pricer_type;
         // constructor
         MCFixedLookbackEngine_2(ext::shared_ptr<GeneralizedBlackScholesProcess> process,
+                           bool useConstantParameters,
                            Size timeSteps,
                            Size timeStepsPerYear,
                            bool brownianBridge,
@@ -66,15 +70,8 @@ namespace QuantLib {
       protected:
         // McSimulation implementation
         TimeGrid timeGrid() const override;
-        ext::shared_ptr<path_generator_type> pathGenerator() const override {
-            TimeGrid grid = timeGrid();
-            typename RNG::rsg_type gen =
-                RNG::make_sequence_generator(grid.size()-1,seed_);
-            return ext::shared_ptr<path_generator_type>(
-                         new path_generator_type(process_,
-                                                 grid, gen, brownianBridge_));
-        }
         ext::shared_ptr<path_pricer_type> pathPricer() const override;
+        ext::shared_ptr<path_generator_type> pathGenerator() const override;
         // data members
         ext::shared_ptr<GeneralizedBlackScholesProcess> process_;
         Size timeSteps_, timeStepsPerYear_;
@@ -83,6 +80,8 @@ namespace QuantLib {
         bool antithetic_;
         bool brownianBridge_;
         BigNatural seed_;
+        bool useConstantParameters_ =false;
+        mutable ext::shared_ptr<StochasticProcess1D> cachedProcess_;
     };
 
 
@@ -144,6 +143,7 @@ namespace QuantLib {
         Size steps_, stepsPerYear_, samples_, maxSamples_;
         Real tolerance_;
         BigNatural seed_ = 0;
+        bool useConstantParameters_ = false;
     };
 
 
@@ -152,6 +152,7 @@ namespace QuantLib {
     template <class RNG, class S>
     inline MCFixedLookbackEngine_2<RNG, S>::MCFixedLookbackEngine_2(
         ext::shared_ptr<GeneralizedBlackScholesProcess> process,
+        bool useConstantParameters_,
         Size timeSteps,
         Size timeStepsPerYear,
         bool brownianBridge,
@@ -160,10 +161,11 @@ namespace QuantLib {
         Real requiredTolerance,
         Size maxSamples,
         BigNatural seed)
+    
     : McSimulation<SingleVariate, RNG, S>(antitheticVariate, false), process_(std::move(process)),
       timeSteps_(timeSteps), timeStepsPerYear_(timeStepsPerYear), requiredSamples_(requiredSamples),
       maxSamples_(maxSamples), requiredTolerance_(requiredTolerance),
-      brownianBridge_(brownianBridge), seed_(seed) {
+      brownianBridge_(brownianBridge), seed_(seed), useConstantParameters_(useConstantParameters_) {
         QL_REQUIRE(timeSteps != Null<Size>() ||
                    timeStepsPerYear != Null<Size>(),
                    "no time steps provided");
@@ -195,18 +197,62 @@ namespace QuantLib {
     }
 
     template <class RNG, class S>
-    inline ext::shared_ptr<typename MCFixedLookbackEngine_2<RNG,S>::path_pricer_type>
-    MCFixedLookbackEngine_2<RNG,S>::pathPricer() const {
-        TimeGrid grid = this->timeGrid();
-        DiscountFactor discount = this->process_->riskFreeRate()->discount(grid.back());
+    inline ext::shared_ptr<typename MCFixedLookbackEngine_2<RNG,S>::path_generator_type>
+    MCFixedLookbackEngine_2<RNG,S>::pathGenerator() const {
+
+        TimeGrid grid = timeGrid();
+        typename RNG::rsg_type gen =
+            RNG::make_sequence_generator(grid.size()-1, seed_);
+
+        // mode normal: simulate with original process (curves)
+        if (!useConstantParameters_) {
+            return ext::shared_ptr<path_generator_type>(
+                new path_generator_type(process_, grid, gen, brownianBridge_));
+        }
+
+        // mode constant: extract params at maturity and use constant process
+        Date maturity = this->arguments_.exercise->lastDate();
 
         ext::shared_ptr<PlainVanillaPayoff> payoff =
             ext::dynamic_pointer_cast<PlainVanillaPayoff>(this->arguments_.payoff);
         QL_REQUIRE(payoff, "non-plain payoff given");
 
+        ConstantBSParams p =
+            extractConstantBSParams(process_, maturity, payoff->strike());
+
+        cachedProcess_ = ext::shared_ptr<StochasticProcess1D>(
+            new ConstantBlackScholesProcess(p.spot, p.r, p.q, p.sigma));
+
+        return ext::shared_ptr<path_generator_type>(
+            new path_generator_type(cachedProcess_, grid, gen, brownianBridge_));
+    }
+
+    template <class RNG, class S>
+    inline ext::shared_ptr<typename MCFixedLookbackEngine_2<RNG,S>::path_pricer_type>
+    MCFixedLookbackEngine_2<RNG,S>::pathPricer() const {
+
+        ext::shared_ptr<PlainVanillaPayoff> payoff =
+            ext::dynamic_pointer_cast<PlainVanillaPayoff>(this->arguments_.payoff);
+        QL_REQUIRE(payoff, "non-plain payoff given");
+
+        Date maturity = this->arguments_.exercise->lastDate();
+
+        // default (QuantLib): use curve discount
+        DiscountFactor discount = process_->riskFreeRate()->discount(maturity);
+
+        if (useConstantParameters_) {
+            ConstantBSParams p =
+                extractConstantBSParams(process_, maturity, payoff->strike());
+
+            Date ref = process_->riskFreeRate()->referenceDate();
+            Time T = process_->riskFreeRate()->dayCounter().yearFraction(ref, maturity);
+
+            discount = std::exp(-p.r * T);
+        }
+
         return ext::make_shared<LookbackFixedPathPricer_2>(payoff->optionType(),
-                                                           payoff->strike(),
-                                                           discount);
+                                                        payoff->strike(),
+                                                        discount);
     }
 
 
@@ -283,6 +329,7 @@ namespace QuantLib {
     template <class RNG, class S>
     inline MakeMCFixedLookbackEngine_2<RNG,S>&
     MakeMCFixedLookbackEngine_2<RNG,S>::withConstantParameters(bool b) {
+        useConstantParameters_ = b;
         return *this;
     }
 
@@ -295,6 +342,7 @@ namespace QuantLib {
 
         return ext::shared_ptr<PricingEngine>(
             new MCFixedLookbackEngine_2<RNG,S>(process_,
+                                               useConstantParameters_,
                                                steps_,
                                                stepsPerYear_,
                                                brownianBridge_,

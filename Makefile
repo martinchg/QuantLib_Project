@@ -9,7 +9,7 @@ test: main
 	./main
 
 main: *.hpp *.cpp
-	g++ *.cpp `quantlib-config --cflags` -g0 -O3 `quantlib-config --libs` -o main
+	g++ *.cpp -I/opt/homebrew/include `quantlib-config --cflags` -O3 `quantlib-config --libs` -L/opt/homebrew/lib -o main
 
 clean:
 	rm -f main

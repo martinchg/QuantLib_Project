@@ -29,6 +29,9 @@
 #include <ql/pricingengines/asian/mcdiscreteasianenginebase.hpp>
 #include <ql/processes/blackscholesprocess.hpp>
 #include <utility>
+#include "constantblackscholesprocess.hpp"
+#include "constant_process_helper.hpp"
+#include <cmath>
 
 namespace QuantLib {
 
@@ -48,6 +51,7 @@ namespace QuantLib {
         // constructor
         MCDiscreteArithmeticASEngine_2(
             const ext::shared_ptr<GeneralizedBlackScholesProcess>& process,
+            bool useConstantParameters,
             bool brownianBridge,
             bool antitheticVariate,
             Size requiredSamples,
@@ -57,6 +61,11 @@ namespace QuantLib {
 
       protected:
         ext::shared_ptr<path_pricer_type> pathPricer() const override;
+        ext::shared_ptr<path_generator_type> pathGenerator() const override;
+
+      private:
+        bool useConstantParameters_;
+        mutable ext::shared_ptr<StochasticProcess1D> cachedProcess_;
     };
 
 
@@ -65,6 +74,7 @@ namespace QuantLib {
     template <class RNG, class S>
     inline MCDiscreteArithmeticASEngine_2<RNG, S>::MCDiscreteArithmeticASEngine_2(
         const ext::shared_ptr<GeneralizedBlackScholesProcess>& process,
+        bool useConstantParameters,
         bool brownianBridge,
         bool antitheticVariate,
         Size requiredSamples,
@@ -78,7 +88,8 @@ namespace QuantLib {
                                                                 requiredSamples,
                                                                 requiredTolerance,
                                                                 maxSamples,
-                                                                seed) {}
+                                                                seed),
+      useConstantParameters_(useConstantParameters) {}
 
     template <class RNG, class S>
     inline ext::shared_ptr<typename MCDiscreteArithmeticASEngine_2<RNG, S>::path_pricer_type>
@@ -96,11 +107,60 @@ namespace QuantLib {
             ext::dynamic_pointer_cast<GeneralizedBlackScholesProcess>(this->process_);
         QL_REQUIRE(process, "Black-Scholes process required");
 
+        Date maturity = exercise->lastDate();
+
+        DiscountFactor disc = process->riskFreeRate()->discount(maturity);
+
+        if (useConstantParameters_) {
+            Real spot = process->stateVariable()->value();
+            ConstantBSParams p = extractConstantBSParams(process, maturity, spot);
+
+            Date ref = process->riskFreeRate()->referenceDate();
+            Time T = process->riskFreeRate()->dayCounter().yearFraction(ref, maturity);
+
+            disc = std::exp(-p.r * T);
+        }
+
         return ext::shared_ptr<typename MCDiscreteArithmeticASEngine_2<RNG, S>::path_pricer_type>(
             new ArithmeticASOPathPricer(payoff->optionType(),
-                                        process->riskFreeRate()->discount(exercise->lastDate()),
+                                        disc,
                                         this->arguments_.runningAccumulator,
                                         this->arguments_.pastFixings));
+    }
+
+    template <class RNG, class S>
+    inline ext::shared_ptr<typename MCDiscreteArithmeticASEngine_2<RNG, S>::path_generator_type>
+    MCDiscreteArithmeticASEngine_2<RNG, S>::pathGenerator() const {
+
+        // mode normal : on garde le process de base
+        if (!useConstantParameters_) {
+            return MCDiscreteAveragingAsianEngineBase<SingleVariate, RNG, S>::pathGenerator();
+        }
+
+        // maturity = dernière date d'exercice (EuropeanExercise attendu ici)
+        ext::shared_ptr<EuropeanExercise> exercise =
+            ext::dynamic_pointer_cast<EuropeanExercise>(this->arguments_.exercise);
+        QL_REQUIRE(exercise, "wrong exercise given");
+        Date maturity = exercise->lastDate();
+
+        // strike : ici average-strike -> pas de strike fixe pertinent,
+        // on prend spot (ATM) pour lire la vol à maturité
+        ext::shared_ptr<GeneralizedBlackScholesProcess> process =
+            ext::dynamic_pointer_cast<GeneralizedBlackScholesProcess>(this->process_);
+        QL_REQUIRE(process, "Black-Scholes process required");
+        Real spot = process->stateVariable()->value();
+        Real strikeForVol = spot;
+
+        ConstantBSParams p = extractConstantBSParams(process, maturity, strikeForVol);
+
+        cachedProcess_ = ext::shared_ptr<StochasticProcess1D>(
+            new ConstantBlackScholesProcess(p.spot, p.r, p.q, p.sigma));
+
+        TimeGrid grid = this->timeGrid();
+        typename RNG::rsg_type rsg = RNG::make_sequence_generator(grid.size() - 1, this->seed_);
+
+        return ext::shared_ptr<path_generator_type>(
+            new path_generator_type(cachedProcess_, grid, rsg, this->brownianBridge_));
     }
 
 
@@ -127,6 +187,7 @@ namespace QuantLib {
         Real tolerance_;
         bool brownianBridge_ = true;
         BigNatural seed_ = 0;
+        bool useConstantParameters_ = false;
     };
 
     template <class RNG, class S>
@@ -185,6 +246,7 @@ namespace QuantLib {
     template <class RNG, class S>
     inline MakeMCDiscreteArithmeticASEngine_2<RNG, S>&
     MakeMCDiscreteArithmeticASEngine_2<RNG, S>::withConstantParameters(bool b) {
+        useConstantParameters_ = b;
         return *this;
     }
 
@@ -192,7 +254,7 @@ namespace QuantLib {
     inline MakeMCDiscreteArithmeticASEngine_2<RNG, S>::operator ext::shared_ptr<PricingEngine>()
         const {
         return ext::shared_ptr<PricingEngine>(new MCDiscreteArithmeticASEngine_2<RNG, S>(
-            process_, brownianBridge_, antithetic_, samples_, tolerance_, maxSamples_, seed_));
+            process_, useConstantParameters_, brownianBridge_, antithetic_, samples_, tolerance_, maxSamples_, seed_));
     }
 
 }
